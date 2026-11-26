@@ -1,0 +1,199 @@
+# Build the X6882 TWRP vendor_boot.img on GitHub-hosted runners.
+#
+# The image is a vendor_boot v4 with two ramdisk fragments (platform +
+# recovery); see BUILD.md for the layout and size budget.  The workflow
+# clones the two device trees from hiruko-puppetmaster into the exact paths
+# the build expects, syncs the TWRP 12.1 minimal manifest, and builds only
+# the vendorbootimage target so the run fits on a hosted runner.
+#
+# Hard limit: vendor_boot is 67,108,864 bytes (64 MiB).  The step fails the
+# run if the built image exceeds it, because a larger image cannot be
+# flashed to the stock partition.
+
+name: Build TWRP vendor_boot (X6882)
+
+on:
+  workflow_dispatch:
+    inputs:
+      twrp_branch:
+        description: 'TWRP minimal manifest branch'
+        required: true
+        default: 'twrp-12.1'
+        type: string
+      device_branch:
+        description: 'Branch of both device trees'
+        required: true
+        default: 'fox_12.1'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-twrp-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TWRP_MANIFEST: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp
+  DEVICE_REPO: https://github.com/hiruko-puppetmaster/twrp-device_infinix_Infinix-X6882.git
+  COMMON_REPO: https://github.com/hiruko-puppetmaster/twrp-device_transsion_mt6789-common.git
+  TWRP_ROOT: /home/runner/twrp
+  MAX_VENDOR_BOOT_SIZE: '67108864'
+
+jobs:
+  build:
+    name: vendor_boot.img (twrp-12.1, arm64)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Reclaim disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /opt/microsoft \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /usr/local/az \
+            /opt/az \
+            /usr/local/pulumi \
+            /usr/local/graalvm \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /usr/lib/mono \
+            /usr/share/swift \
+            /usr/local/.ghcup \
+            /usr/local/lib/node_modules \
+            /usr/local/share/nvm \
+            /usr/share/miniconda \
+            /usr/local/go \
+            /opt/android-sdk /opt/android-ndk
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          # i386 multiarch is needed by the 32-bit host libraries the AOSP
+          # build system still links into a few host tools.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex fontconfig \
+            g++-multilib gcc-multilib git gnupg gperf imagemagick \
+            lib32ncurses-dev lib32readline-dev lib32z1-dev libc6-dev-i386 \
+            libelf-dev liblz4-tool libncurses-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop openjdk-11-jdk pngcrush \
+            python-is-python3 python3 rsync schedtool squashfs-tools unzip \
+            xsltproc zip zlib1g-dev
+          # AOSP 12 expects Java 11.
+          sudo update-alternatives --set java /usr/lib/jvm/java-11-openjdk-amd64/bin/java
+          sudo update-alternatives --set javac /usr/lib/jvm/java-11-openjdk-amd64/bin/javac
+          java -version
+
+      - name: Install repo and git identity
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
+
+      - name: Sync TWRP minimal manifest
+        run: |
+          set -euo pipefail
+          mkdir -p "$TWRP_ROOT"
+          cd "$TWRP_ROOT"
+          repo init --depth=1 -u "$TWRP_MANIFEST" -b "${{ inputs.twrp_branch }}"
+          for attempt in 1 2 3; do
+            if repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags; then
+              break
+            fi
+            echo "repo sync attempt $attempt failed, retrying" >&2
+            sleep 15
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+          done
+          test -d build/make
+          df -h /
+
+      - name: Clone device trees
+        run: |
+          set -euo pipefail
+          cd "$TWRP_ROOT"
+          rm -rf device/infinix/Infinix-X6882 device/transsion/mt6789-common
+          mkdir -p device/infinix device/transsion
+          GIT_TERMINAL_PROMPT=0 git clone --depth=1 -b "${{ inputs.device_branch }}" \
+            "$DEVICE_REPO" device/infinix/Infinix-X6882
+          GIT_TERMINAL_PROMPT=0 git clone --depth=1 -b "${{ inputs.device_branch }}" \
+            "$COMMON_REPO" device/transsion/mt6789-common
+          echo "device  $(git -C device/infinix/Infinix-X6882 rev-parse HEAD)"
+          echo "common  $(git -C device/transsion/mt6789-common rev-parse HEAD)"
+          # The fix must be present in the tree that is actually built.
+          grep -q 'mount ext4 /dev/block/by-name/persist' \
+            device/transsion/mt6789-common/recovery/root/init.recovery.mt6789.rc
+          grep -q 'start mobicore' \
+            device/transsion/mt6789-common/recovery/root/init.recovery.mt6789.rc
+
+      - name: Build vendorbootimage
+        run: |
+          set -eo pipefail
+          cd "$TWRP_ROOT"
+          export LC_ALL=C
+          export TZ=UTC
+          source build/envsetup.sh
+          lunch twrp_X6882-eng
+          mka vendorbootimage -j"$(nproc)"
+
+      - name: Verify image
+        run: |
+          set -euo pipefail
+          cd "$TWRP_ROOT"
+          OUT="out/target/product/Infinix-X6882"
+          IMG="$OUT/vendor_boot.img"
+          test -f "$IMG"
+          SIZE="$(stat -c%s "$IMG")"
+          SHA="$(sha256sum "$IMG" | cut -d' ' -f1)"
+          echo "vendor_boot.img bytes: $SIZE"
+          echo "vendor_boot.img sha256: $SHA"
+          if [ "$SIZE" -gt "$MAX_VENDOR_BOOT_SIZE" ]; then
+            echo "::error::vendor_boot.img is $SIZE bytes, limit is $MAX_VENDOR_BOOT_SIZE"
+            exit 1
+          fi
+          # The recovery root is packed verbatim; check the rc and resetprop
+          # made it in before the image is uploaded.
+          RC="$OUT/recovery/root/init.recovery.mt6789.rc"
+          grep -q 'mount ext4 /dev/block/by-name/persist' "$RC"
+          test -x "$OUT/recovery/root/system/bin/resetprop"
+          {
+            echo "commit:  $GITHUB_SHA"
+            echo "run:     $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "twrp:    ${{ inputs.twrp_branch }}"
+            echo "trees:   ${{ inputs.device_branch }}"
+            echo "device:  $(git -C device/infinix/Infinix-X6882 rev-parse HEAD)"
+            echo "common:  $(git -C device/transsion/mt6789-common rev-parse HEAD)"
+            echo "bytes:   $SIZE"
+            echo "sha256:  $SHA"
+          } | tee "$OUT/BUILD_INFO.txt"
+          cp "$IMG" "$RUNNER_TEMP/vendor_boot.img"
+          cp "$OUT/BUILD_INFO.txt" "$RUNNER_TEMP/BUILD_INFO.txt"
+          sha256sum "$RUNNER_TEMP/vendor_boot.img" > "$RUNNER_TEMP/vendor_boot.img.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor_boot-X6882-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/vendor_boot.img
+            ${{ runner.temp }}/vendor_boot.img.sha256
+            ${{ runner.temp }}/BUILD_INFO.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
