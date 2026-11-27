@@ -184,7 +184,7 @@ jobs:
           } | tee "$OUT/BUILD_INFO.txt"
           cp "$IMG" "$RUNNER_TEMP/vendor_boot.img"
           cp "$OUT/BUILD_INFO.txt" "$RUNNER_TEMP/BUILD_INFO.txt"
-          sha256sum "$RUNNER_TEMP/vendor_boot.img" > "$RUNNER_TEMP/vendor_boot.img.sha256"
+          sha256sum "$RUNNER_TEMP/vendor_boot.img" | sed "s|$RUNNER_TEMP/||" > "$RUNNER_TEMP/vendor_boot.img.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
